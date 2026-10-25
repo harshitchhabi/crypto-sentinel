@@ -25,7 +25,7 @@ Subcommands:
 
 Key derivation: by default the 32-byte ML-KEM shared secret is used
 directly as the AES-256 key (`--kdf raw`). If the organizers used HKDF,
-pass `--kdf hkdf` (SHA-256, no salt, info=b"pqenc") on both sides.
+pass `--kdf hkdf` (SHA-256, no salt, info=b"pqenc") or `--kdf auto` on decrypt.
 """
 
 import argparse
@@ -34,10 +34,7 @@ import json
 import os
 import sys
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import mlkem, mldsa
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from crypto_engine import pqc
 
 # Target field byte-lengths, used by selftest to confirm format fidelity.
 TARGET_SIZES = {
@@ -64,8 +61,7 @@ def derive_aes_key(shared_secret, kdf):
     if kdf == "raw":
         return shared_secret
     if kdf == "hkdf":
-        return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
-                    info=b"pqenc").derive(shared_secret)
+        return pqc.hkdf_sha256(shared_secret, length=32, salt=None, info=b"pqenc")
     raise ValueError(f"unknown kdf: {kdf}")
 
 
@@ -87,8 +83,7 @@ def encrypt_envelope(plaintext, kem_public, sig_private, kdf="raw"):
     aes_key = derive_aes_key(shared_secret, kdf)
 
     nonce = os.urandom(12)
-    ct_and_tag = AESGCM(aes_key).encrypt(nonce, plaintext, None)
-    ciphertext, tag = ct_and_tag[:-16], ct_and_tag[-16:]
+    ciphertext, tag = pqc.aes_gcm_encrypt(aes_key, nonce, plaintext, aad=None)
 
     sig_public = sig_private.public_key()
     signature = sig_private.sign(signed_blob(kem_cipher, nonce, tag, ciphertext))
@@ -107,26 +102,47 @@ def decrypt_envelope(envelope, kem_private, kdf="raw", verify=True):
     """Open an envelope. Returns ``(plaintext_bytes, signature_ok)``.
 
     ``signature_ok`` is None when ``verify`` is False, else a bool from
-    checking the embedded ML-DSA-87 public key against the signed blob.
+    checking the embedded ML-DSA-87 public key against the signed blob
+    (or decrypted plaintext if the sender signed the plaintext before encryption).
     """
     kem_cipher = _b64d(envelope["kem_cipher"])
     nonce = _b64d(envelope["nonce"])
     tag = _b64d(envelope["auth_tag"])
     ciphertext = _b64d(envelope["ciphertext"])
 
-    shared_secret = kem_private.decapsulate(kem_cipher)
-    aes_key = derive_aes_key(shared_secret, kdf)
-    plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext + tag, None)
-
     sig_ok = None
+    sig_public = None
+    sig_bytes = None
     if verify:
-        sig_public = mldsa.MLDSA87PublicKey.from_public_bytes(_b64d(envelope["public_key"]))
+        sig_public = pqc.MLDSA87PublicKey.from_public_bytes(_b64d(envelope["public_key"]))
+        sig_bytes = _b64d(envelope["signature"])
         try:
-            sig_public.verify(_b64d(envelope["signature"]),
-                              signed_blob(kem_cipher, nonce, tag, ciphertext))
+            sig_public.verify(sig_bytes, signed_blob(kem_cipher, nonce, tag, ciphertext))
             sig_ok = True
         except Exception:
             sig_ok = False
+
+    shared_secret = kem_private.decapsulate(kem_cipher)
+    kdf_modes = ["raw", "hkdf"] if kdf == "auto" else [kdf]
+    plaintext = None
+    for mode in kdf_modes:
+        aes_key = derive_aes_key(shared_secret, mode)
+        plaintext = pqc.aes_gcm_decrypt(ciphertext, aes_key, nonce, tag, aad=None)
+        if plaintext is not None:
+            break
+
+    if plaintext is None:
+        raise ValueError("AES-GCM authentication failed (wrong key or KDF mode)")
+
+    # If envelope signature did not match the outer ciphertext blob, check
+    # whether the sender signed the plaintext directly.
+    if verify and not sig_ok and sig_public is not None:
+        try:
+            sig_public.verify(sig_bytes, plaintext)
+            sig_ok = True
+        except Exception:
+            pass
+
     return plaintext, sig_ok
 
 
@@ -135,41 +151,14 @@ def decrypt_envelope(envelope, kem_private, kdf="raw", verify=True):
 # ---------------------------------------------------------------------------
 
 def _read_key_bytes(path):
-    """Read a key file as raw bytes, tolerating base64/hex text wrappers."""
-    with open(path, "rb") as fh:
-        data = fh.read()
-    stripped = data.strip()
-    # try base64, then hex, else assume raw
-    try:
-        d = base64.b64decode(stripped, validate=True)
-        if d:
-            return d
-    except Exception:
-        pass
-    try:
-        return bytes.fromhex(stripped.decode("ascii"))
-    except Exception:
-        pass
-    return data
-
-
-def load_kem_private(args):
-    if args.seed:
-        return mlkem.MLKEM1024PrivateKey.from_seed_bytes(_read_key_bytes(args.seed))
-    return mlkem.MLKEM1024PrivateKey.from_seed_bytes(_read_key_bytes(args.kem_priv)) \
-        if getattr(args, "kem_priv_is_seed", False) \
-        else _load_kem_private_raw(args.kem_priv)
+    """Read a key file safely (raw binary, hex text, or base64 text)."""
+    return pqc.read_key_bytes(path)
 
 
 def _load_kem_private_raw(path):
+    """Load an ML-KEM-1024 private key from a 64-byte seed, 3168-byte raw key, or DER."""
     raw = _read_key_bytes(path)
-    # from_seed_bytes expects a 64-byte seed; a full expanded private key is
-    # larger. Try seed first, fall back to raw private bytes.
-    try:
-        return mlkem.MLKEM1024PrivateKey.from_seed_bytes(raw)
-    except Exception:
-        from cryptography.hazmat.primitives.serialization import load_der_private_key
-        return load_der_private_key(raw, password=None)
+    return pqc.MLKEM1024PrivateKey.from_private_bytes(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +166,13 @@ def _load_kem_private_raw(path):
 # ---------------------------------------------------------------------------
 
 def cmd_selftest(args):
-    kem_priv = mlkem.MLKEM1024PrivateKey.generate()
+    kem_priv = pqc.MLKEM1024PrivateKey.generate()
     kem_pub = kem_priv.public_key()
-    sig_priv = mldsa.MLDSA87PrivateKey.generate()
+    sig_priv = pqc.MLDSA87PrivateKey.generate()
 
     message = b"msbj" + os.urandom(225)  # 229 bytes, same as the target payload
-    env = encrypt_envelope(message, kem_pub, sig_priv, kdf=args.kdf)
+    kdf_mode = "raw" if args.kdf == "auto" else args.kdf
+    env = encrypt_envelope(message, kem_pub, sig_priv, kdf=kdf_mode)
 
     print("field byte-lengths (generated vs target):")
     ok = True
@@ -209,31 +199,29 @@ def cmd_selftest(args):
 
 def cmd_keygen(args):
     os.makedirs(args.out_dir, exist_ok=True)
-    kem_priv = mlkem.MLKEM1024PrivateKey.generate()
-    sig_priv = mldsa.MLDSA87PrivateKey.generate()
+    kem_priv = pqc.MLKEM1024PrivateKey.generate()
+    sig_priv = pqc.MLDSA87PrivateKey.generate()
 
-    def write(name, raw):
+    def write(name, raw, is_private=False):
         path = os.path.join(args.out_dir, name)
-        with open(path, "wb") as fh:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600 if is_private else 0o644
+        fd = os.open(path, flags, mode)
+        with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
         print(f"  wrote {path} ({len(raw)} bytes)")
 
-    write("kem_private.raw", kem_priv.private_bytes_raw())
-    write("kem_public.raw", kem_priv.public_key().public_bytes_raw())
-    write("sig_private.raw", sig_priv.private_bytes_raw())
-    write("sig_public.raw", sig_priv.public_key().public_bytes_raw())
+    write("kem_private.raw", kem_priv.private_bytes_raw(), is_private=True)
+    write("kem_public.raw", kem_priv.public_key().public_bytes_raw(), is_private=False)
+    write("sig_private.raw", sig_priv.private_bytes_raw(), is_private=True)
+    write("sig_public.raw", sig_priv.public_key().public_bytes_raw(), is_private=False)
     print(f"keypairs written to {args.out_dir}/")
     return 0
 
 
 def cmd_encrypt(args):
-    kem_pub = mlkem.MLKEM1024PublicKey.from_public_bytes(_read_key_bytes(args.kem_pub))
-    sig_priv_raw = _read_key_bytes(args.sig_priv)
-    try:
-        sig_priv = mldsa.MLDSA87PrivateKey.from_seed_bytes(sig_priv_raw)
-    except Exception:
-        from cryptography.hazmat.primitives.serialization import load_der_private_key
-        sig_priv = load_der_private_key(sig_priv_raw, password=None)
+    kem_pub = pqc.MLKEM1024PublicKey.from_public_bytes(_read_key_bytes(args.kem_pub))
+    sig_priv = pqc.MLDSA87PrivateKey.from_private_bytes(_read_key_bytes(args.sig_priv))
 
     if args.plaintext is not None:
         pt = args.plaintext.encode()
@@ -241,7 +229,8 @@ def cmd_encrypt(args):
         with open(args.infile, "rb") as fh:
             pt = fh.read()
 
-    env = encrypt_envelope(pt, kem_pub, sig_priv, kdf=args.kdf)
+    kdf_mode = "raw" if args.kdf == "auto" else args.kdf
+    env = encrypt_envelope(pt, kem_pub, sig_priv, kdf=kdf_mode)
     out = json.dumps(env, indent=2)
     if args.out:
         with open(args.out, "w") as fh:
@@ -256,9 +245,8 @@ def cmd_decrypt(args):
     with open(args.envelope) as fh:
         env = json.load(fh)
 
-    seed = _read_key_bytes(args.seed) if args.seed else None
-    if seed is not None:
-        kem_priv = mlkem.MLKEM1024PrivateKey.from_seed_bytes(seed)
+    if args.seed:
+        kem_priv = pqc.MLKEM1024PrivateKey.from_seed_bytes(_read_key_bytes(args.seed))
     else:
         kem_priv = _load_kem_private_raw(args.kem_priv)
 
@@ -279,7 +267,7 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    common_kdf = dict(choices=["raw", "hkdf"], default="raw",
+    common_kdf = dict(choices=["raw", "hkdf", "auto"], default="raw",
                       help="AES-key derivation from the KEM shared secret (default: raw)")
 
     s = sub.add_parser("selftest", help="round-trip and assert format fidelity")
@@ -303,9 +291,10 @@ def build_parser():
     d = sub.add_parser("decrypt", help="open an envelope with the KEM private key")
     d.add_argument("--envelope", default="pass.txt.pqenc")
     kgrp = d.add_mutually_exclusive_group(required=True)
-    kgrp.add_argument("--kem-priv", help="ML-KEM-1024 private key file")
+    kgrp.add_argument("--kem-priv", help="ML-KEM-1024 private key file (64B seed, 3168B raw, or DER)")
     kgrp.add_argument("--seed", help="ML-KEM-1024 keygen seed file (64 bytes)")
-    d.add_argument("--kdf", **common_kdf)
+    d.add_argument("--kdf", choices=["raw", "hkdf", "auto"], default="auto",
+                   help="AES-key derivation (default: auto tries raw then hkdf)")
     d.add_argument("--known-prefix", default="msbj")
     d.add_argument("--no-verify", action="store_true", help="skip signature check")
     d.set_defaults(func=cmd_decrypt)

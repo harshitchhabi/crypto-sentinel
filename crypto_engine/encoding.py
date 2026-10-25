@@ -13,8 +13,11 @@ def try_base64(data):
     """Decode standard base64. Accepts ``str`` or ``bytes``."""
     try:
         raw = data.encode() if isinstance(data, str) else data
+        raw = raw.strip()
+        if not raw:
+            return None
         return base64.b64decode(raw, validate=True)
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, UnicodeEncodeError):
         return None
 
 
@@ -22,10 +25,13 @@ def try_urlsafe_base64(data):
     """Decode url-safe base64 (``-`` / ``_`` alphabet)."""
     try:
         raw = data.encode() if isinstance(data, str) else data
+        raw = raw.strip()
+        if not raw:
+            return None
         # pad to a multiple of 4
         raw += b"=" * (-len(raw) % 4)
         return base64.urlsafe_b64decode(raw)
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, UnicodeEncodeError):
         return None
 
 
@@ -33,8 +39,11 @@ def try_base32(data):
     """Decode base32."""
     try:
         raw = data.encode() if isinstance(data, str) else data
+        raw = raw.strip()
+        if not raw:
+            return None
         return base64.b32decode(raw, casefold=True)
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, UnicodeEncodeError):
         return None
 
 
@@ -43,8 +52,10 @@ def try_hex(data):
     try:
         s = data.decode() if isinstance(data, bytes) else data
         s = s.strip()
+        if not s:
+            return None
         return bytes.fromhex(s)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, UnicodeDecodeError):
         return None
 
 

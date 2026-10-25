@@ -2,35 +2,63 @@
 """Driver: solve pass.txt.pqenc using the crypto_engine toolkit.
 
 Usage:
-    python3 solve.py [FILE] [KNOWN_PREFIX]
+    python3 solve.py [FILE] [KNOWN_PREFIX] [--kem-priv KEYFILE | --seed SEEDFILE | --aes-key-hex HEX]
 
 Inspection showed FILE is a JSON envelope for a hybrid post-quantum
 scheme (ML-KEM-1024 KEM + AES-256-GCM, signed with ML-DSA-87), not a
 classical / XOR / RSA / AES-ECB target. The analyzer therefore identifies
 the envelope and reports exactly what is needed to finish it.
 
-If you have recovered the 32-byte AES-GCM key (via KEM decapsulation with
-the private key), supply it and the payload decrypts immediately:
+If you have recovered the ML-KEM-1024 private key / seed or the 32-byte
+AES-GCM key, supply it and the payload decrypts immediately:
 
+    python3 solve.py pass.txt.pqenc msbj --kem-priv keys/kem_private.raw
     AES_KEY_HEX=<64 hex chars> python3 solve.py
 """
 
+import argparse
 import os
 import sys
 
-from crypto_engine import analyzer
+from crypto_engine import analyzer, pqc
 
 
-def main():
-    filepath = sys.argv[1] if len(sys.argv) > 1 else "pass.txt.pqenc"
-    known_prefix = sys.argv[2] if len(sys.argv) > 2 else "msbj"
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("filepath", nargs="?", default="pass.txt.pqenc",
+                   help="Path to the encrypted file (default: pass.txt.pqenc)")
+    p.add_argument("known_prefix", nargs="?", default="msbj",
+                   help="Known plaintext prefix (default: msbj)")
+    p.add_argument("--kem-priv", help="ML-KEM-1024 private key file (64B seed, 3168B raw, or DER)")
+    p.add_argument("--seed", help="ML-KEM-1024 64-byte seed file")
+    p.add_argument("--aes-key-hex", help="Hex-encoded 32-byte AES-256-GCM key (or set AES_KEY_HEX)")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    filepath = args.filepath
+    known_prefix = args.known_prefix
 
     aes_key = None
-    key_hex = os.environ.get("AES_KEY_HEX")
+    key_hex = args.aes_key_hex or os.environ.get("AES_KEY_HEX")
     if key_hex:
-        aes_key = bytes.fromhex(key_hex)
+        try:
+            aes_key = bytes.fromhex(key_hex.strip())
+        except ValueError as exc:
+            print(f"error: invalid hex in AES key: {exc}", file=sys.stderr)
+            return 1
 
-    result = analyzer.solve_with_hint(filepath, known_prefix, aes_key=aes_key)
+    kem_private = None
+    if args.seed:
+        kem_private = pqc.MLKEM1024PrivateKey.from_seed_bytes(pqc.read_key_bytes(args.seed))
+    elif args.kem_priv:
+        kem_private = pqc.MLKEM1024PrivateKey.from_private_bytes(pqc.read_key_bytes(args.kem_priv))
+
+    result = analyzer.solve_with_hint(
+        filepath, known_prefix, aes_key=aes_key, kem_private=kem_private
+    )
 
     print(f"target:       {filepath}")
     print(f"known prefix: {known_prefix!r}")
@@ -60,12 +88,14 @@ def main():
             shown = repr(pt)
         print(f"SUCCESS via {result['method']}")
         print(f"plaintext: {shown}")
+        return 0
     else:
         print("NOT SOLVED with available inputs.")
         blocked = result["details"].get("blocked_on")
         if blocked:
             print(f"blocked on: {blocked}")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

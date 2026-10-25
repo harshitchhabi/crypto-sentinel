@@ -1,0 +1,2 @@
+# Optional (crypto_engine/pqc.py also supports OpenSSL 3.5+ libcrypto directly via ctypes)
+cryptography>=42.0.0
