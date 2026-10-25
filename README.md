@@ -16,6 +16,8 @@ crypto_engine/
   analyzer.py    solve_with_hint(): fan every module out against a blob
 inspect_pqenc.py quick raw-bytes inspector (size, hex dump, format guess)
 solve.py         driver for pass.txt.pqenc
+generate.py      build / open the hybrid PQC envelope (ML-KEM-1024 + AES-256-GCM, ML-DSA-87)
+KEYHUNT.md       findings log for the pass.txt.pqenc key hunt
 ```
 
 ## Usage
@@ -27,6 +29,30 @@ python3 inspect_pqenc.py pass.txt.pqenc
 # 2. Solve with a known plaintext prefix
 python3 solve.py pass.txt.pqenc msbj
 ```
+
+## Generating / decrypting the PQC envelope
+
+`generate.py` is a reference implementation of the exact envelope scheme.
+Its `selftest` round-trips a message and asserts the generated field
+byte-lengths match `pass.txt.pqenc` (1568 / 2592 / 4627 / 12 / 16):
+
+```bash
+python3 generate.py selftest           # prove format fidelity + round-trip
+python3 generate.py keygen --out-dir keys
+python3 generate.py encrypt --kem-pub keys/kem_public.raw \
+    --sig-priv keys/sig_private.raw --plaintext "msbj..." --out env.json
+```
+
+Once the organizers provide the real ML-KEM-1024 private key (or its
+keygen seed), decryption is a one-liner:
+
+```bash
+python3 generate.py decrypt --envelope pass.txt.pqenc --kem-priv KEYFILE
+# or, if a seed:  --seed SEEDFILE
+# if they used HKDF instead of the raw shared secret:  --kdf hkdf
+```
+
+Generated key files (`keys/`, `*.raw`) are gitignored and never committed.
 
 `solve_with_hint(filepath, known_prefix)` loads the file, tries every
 applicable module, and reports the first method whose decrypted output
